@@ -97,6 +97,22 @@ for (const [label, initialMap, latestMap, expected] of [
   })
 }
 
+test('reordered servers, tools and duplicate entries do not restart the same policy', async t => {
+  const pending = deferred()
+  let stored = { alpha: ['one'], demo: ['hidden', 'other'] }
+  const registered = [{ name: TOOL }, { name: 'mcp__demo__other' }, { name: 'mcp__alpha__one' }]
+  const f = fixture(t, { read: async () => stored, schemas: () => pending.promise })
+  await tick()
+  const applying = f.visibility.applyToolRestrictions(); await tick()
+  stored = { demo: ['other', 'hidden', 'hidden'], alpha: ['one', 'one'] }
+  await f.visibility.readDisabledTools(true)
+  stored = { alpha: ['one'], demo: ['hidden', 'other', 'other'] }
+  await f.visibility.readDisabledTools(true)
+  pending.resolve(registered); await applying; await tick()
+  assert.deepEqual(f.denied(), ['mcp__alpha__one', TOOL, 'mcp__demo__other'])
+  assert.equal(f.schemaCalls(), 1, 'equivalent reader traffic cannot perpetually restart schemas')
+})
+
 test('a different newer sidecar snapshot reconciles the interrupted visibility apply', async t => {
   const pending = deferred(); let stored = { demo: ['hidden'] }; let pause = false
   const registered = [{ name: TOOL }, { name: 'mcp__demo__visible' }]
