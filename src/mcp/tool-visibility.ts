@@ -72,9 +72,15 @@ export function createToolVisibility(deps: ToolVisibilityDeps): ToolVisibility {
   // before the body runs. Disabled tools therefore become invisible AND
   // uncallable — no patch rewrite, no DSH restart.
   let disabledToolsCache: { at: number; value: Record<string, string[]> } | null = null
+  let disposed = false
+  let replayRevision = 0
+  let readRevision = 0
   async function readDisabledTools(force = false): Promise<Record<string, string[]>> {
+    if (disposed) return disabledToolsCache?.value ?? {}
     if (disabledToolsCache && !force && Date.now() - disabledToolsCache.at < deps.SIDECAR_TTL_MS) return disabledToolsCache.value
+    const mine = ++readRevision
     const p = await deps.ensurePaths()
+    if (disposed) return disabledToolsCache?.value ?? {}
     const raw = await deps.readJsonFile(deps.mcpSidecar(deps.MCP_DISABLED_TOOLS_FILE))
     const out: Record<string, string[]> = {}
     if (raw && typeof raw === 'object') {
@@ -88,8 +94,23 @@ export function createToolVisibility(deps: ToolVisibilityDeps): ToolVisibility {
         }
       }
     }
-    disabledToolsCache = { at: Date.now(), value: out }
-    return out
+    // Late reads cannot overwrite either a newer read or a committed settings write.
+    if (disposed || mine !== readRevision) return disabledToolsCache?.value ?? out
+    // Repeated reads of the same policy must not invalidate a pending apply.
+    const current = disabledToolsCache?.value
+    const value = current && disabledToolsKey(current) === disabledToolsKey(out) ? current : out
+    disabledToolsCache = { at: Date.now(), value }
+    return value
+  }
+  function disabledToolsKey(value: Record<string, string[]>): string {
+    return JSON.stringify(Object.keys(value).sort().map(server => [server, [...new Set(value[server])].sort()]))
+  }
+  function setDisabledToolsCache(value: Record<string, string[]>): void {
+    if (disposed) return
+    readRevision += 1
+    replayRevision += 1
+    epoch += 1
+    disabledToolsCache = { at: Date.now(), value }
   }
   /** Fully-qualified model-facing names (`mcp__<serverName>__<tool>`) of every disabled tool. */
   function disabledToolNames(map: Record<string, string[]>): string[] {
@@ -190,7 +211,7 @@ export function createToolVisibility(deps: ToolVisibilityDeps): ToolVisibility {
       } catch (e) {
         return { ok: false, error: '保存失败: ' + deps.message(e) }
       }
-      disabledToolsCache = { at: Date.now(), value: map }
+      setDisabledToolsCache(map)
       await applyToolRestrictions()
       return { ok: true, serverName, disabled: map[serverName] || [] }
     })
@@ -240,13 +261,14 @@ export function createToolVisibility(deps: ToolVisibilityDeps): ToolVisibility {
 
   /** 把该 agent 该背的名单装到它 scope 上（全局那份 ∪ 它自己那份；空名单 = 不碰它）。 */
   async function restrictAgent(agent: any): Promise<void> {
+    if (disposed) return
     const mine = epoch
     let extra: string[] = []
     if (deps.carrierHiddenTools) {
       // 判据失败一律当"没有额外要藏的"：藏错了模型就少一条路，留着只是多花 token。
       try { extra = await deps.carrierHiddenTools(agent) } catch (e) { extra = [] }
     }
-    if (mine !== epoch) return
+    if (disposed || mine !== epoch) return
     if (!seenAgents.has(agent)) return
     const names = [...new Set([...desiredNames, ...extra])]
     const scoped = scopedToolsOf(agent)
@@ -290,6 +312,7 @@ export function createToolVisibility(deps: ToolVisibilityDeps): ToolVisibility {
 
   /** agent 上线（`agent/created` 或启动期的 agent 列表）：登记并立刻应用当前名单。 */
   function attachAgent(agent: any): void {
+    if (disposed) return
     if (!agent || (typeof agent !== 'object' && typeof agent !== 'function')) return
     seenAgents.add(agent)
     void restrictAgent(agent).catch(() => { /* 可见性半边 best effort */ })
@@ -302,6 +325,10 @@ export function createToolVisibility(deps: ToolVisibilityDeps): ToolVisibility {
   }
 
   async function applyToolRestrictions(): Promise<void> {
+    if (disposed) return
+    // Allocate before either await: completion order must not decide authority.
+    const mine = ++replayRevision
+    epoch += 1
     // 全局 tools 面上没有 restrict → 可见性半边整条做不成，如实上报（2026-09-30 审查 P2-8）。
     // 此前这里是**裸 return**：停用工具仍留在模型可见的工具表里，而兼容页因为没有上报仍报
     // 一行"ok"，用户看到的是"停用了但工具还在"。与 `restrictAgent` 里那条 noteRuntime 同文案、
@@ -320,12 +347,17 @@ export function createToolVisibility(deps: ToolVisibilityDeps): ToolVisibility {
     // Force re-read: this runs on the tools/change path, which is rare, so a
     // stale cache must not keep an externally edited deny list hidden.
     const map = await readDisabledTools(true)
+    if (disposed || mine !== replayRevision) return
     // 通配 `*`（整服务器停用）先展开成已注册的全名，再与精确名单合并。
     const wanted = disabledToolNames(map)
     let registered: Set<string>
     try {
       registered = new Set((await deps.tools.schemas()).map((schema) => String(schema.name)))
     } catch (e) { return }
+    if (disposed || mine !== replayRevision) return
+    // A newer sidecar reader can discover another policy without requesting replay.
+    // Reconcile it rather than leave the old layer installed indefinitely.
+    if (map !== disabledToolsCache?.value) return applyToolRestrictions()
     for (const [serverName, list] of Object.entries(map)) {
       if (list.indexOf('*') < 0) continue
       const prefix = MCP_TOOL_PREFIX + serverName + '__'
@@ -337,6 +369,10 @@ export function createToolVisibility(deps: ToolVisibilityDeps): ToolVisibility {
     if (deps.pluginHiddenTools) {
       try { for (const name of deps.pluginHiddenTools()) wanted.push(name) } catch (e) { /* 读设置失败 = 这次不摘它们 */ }
     }
+    if (disposed || mine !== replayRevision) return
+    // A newer sidecar reader can discover another policy without requesting replay.
+    // Reconcile it rather than leave the old layer installed indefinitely.
+    if (map !== disabledToolsCache?.value) return applyToolRestrictions()
     const names = [...new Set(wanted)].filter((name) => registered.has(name))
     const key = names.join('\u0000')
     // 有 `carrierHiddenTools` 时不拿全局键短路：那份名单与"官方工具此时挂没挂"有关，
@@ -346,13 +382,16 @@ export function createToolVisibility(deps: ToolVisibilityDeps): ToolVisibility {
     if (key === appliedNamesKey && deps.carrierHiddenTools === undefined) return
     appliedNamesKey = key
     desiredNames = names
-    // 每次重放先撤掉每个 agent 上的旧层：名单变短（重新启用某个工具）时，只有撤掉这层限制
-    // 它才会重新可见；名单变了（含逐 agent 那份）也必须重装而不是叠加。
-    epoch += 1
-    for (const agent of [...agentRestrictions.keys()]) liftRestriction(agent)
+    // Keep per-agent keys: restrictAgent replaces a layer only when its deny list changes.
+    // Unconditionally lifting here erases the keys and creates a tools/change feedback loop.
+    for (const agent of [...agentRestrictions.keys()])
+      if (!seenAgents.has(agent)) liftRestriction(agent)
     for (const agent of seenAgents) void restrictAgent(agent).catch(() => { /* best effort */ })
   }
   function scheduleToolRestrictions(): void {
+    if (disposed) return
+    replayRevision += 1
+    epoch += 1
     if (restrictTimer) return
     restrictTimer = setTimeout(() => {
       restrictTimer = null
@@ -361,6 +400,9 @@ export function createToolVisibility(deps: ToolVisibilityDeps): ToolVisibility {
   }
   /** 卸载清理：清掉重排定时器、把挂在每个 agent scope 上的限制都撤掉（母文件 dispose 的那六行原样搬来）。 */
   function disposeVisibility(): void {
+    disposed = true
+    readRevision += 1
+    replayRevision += 1
     if (restrictTimer) { clearTimeout(restrictTimer); restrictTimer = null }
     // 插件卸载时把挂在每个 agent scope 上的限制都撤掉（否则那些 scope 会继续背着一层名单）。
     epoch += 1
@@ -380,7 +422,7 @@ export function createToolVisibility(deps: ToolVisibilityDeps): ToolVisibility {
     detachAgent,
     applyToolRestrictions,
     scheduleToolRestrictions,
-    setDisabledToolsCache: (value: Record<string, string[]>) => { disabledToolsCache = { at: Date.now(), value } },
+    setDisabledToolsCache,
     disabledToolsSnapshot: () => (disabledToolsCache ? disabledToolsCache.value : {}),
     disposeVisibility,
   }

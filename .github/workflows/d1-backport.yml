@@ -1,0 +1,30 @@
+name: d1-compatible-backport
+on:
+  pull_request:
+    branches: [compat/v0.20.0]
+  push:
+    branches: [fix/restriction-revision-v020, compat/v0.20.0]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      HOME: ${{ github.workspace }}/.ci-private/home
+      DSH_HOME: ${{ github.workspace }}/.ci-private/dsh
+      XDG_CONFIG_HOME: ${{ github.workspace }}/.ci-private/config
+      XDG_DATA_HOME: ${{ github.workspace }}/.ci-private/data
+      XDG_STATE_HOME: ${{ github.workspace }}/.ci-private/state
+      XDG_CACHE_HOME: ${{ github.workspace }}/.ci-private/cache
+      TMPDIR: ${{ github.workspace }}/.ci-private/tmp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26.11.1
+      - name: Private profile roots (build invokes sync-profile)
+        run: mkdir -p "$HOME" "$DSH_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME" "$TMPDIR"
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm test
+      - run: npm run lint
