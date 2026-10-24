@@ -40,7 +40,7 @@
     "check:host": "node scripts/host-deps.mjs && node scripts/doctor.mjs",
     "host-deps": "node scripts/host-deps.mjs --fix",
     "doctor": "node scripts/doctor.mjs",
-    "test": "npm run build && npm run check:i18n && npm run typecheck:client && node --test test/contracts.test.mjs test/client-exports.test.mjs",
+    "test": "npm run build && npm run check:i18n && npm run typecheck:client && node --test test/contracts.test.mjs test/client-exports.test.mjs test/tool-visibility-races.test.mjs test/tool-visibility-runtime.test.mjs",
     "sync:profile": "node scripts/sync-profile.mjs"
   },
   "keywords": [
