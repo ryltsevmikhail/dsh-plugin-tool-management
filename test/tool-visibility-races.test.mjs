@@ -75,6 +75,42 @@ for (const [label, oldMap, latestMap, expectedDeny] of [
   })
 }
 
+for (const [label, initialMap, latestMap, expected] of [
+  ['standalone allow read must release old deny', { demo: ['hidden'] }, {}, []],
+  ['standalone deny read must install new deny', {}, { demo: ['hidden'] }, [TOOL]],
+]) {
+  test(label, async t => {
+    const pending = deferred(); let stored = initialMap; let pause = false
+    const f = fixture(t, {
+      read: async () => stored,
+      schemas: () => pause ? pending.promise : Promise.resolve([{ name: TOOL }]),
+    })
+    await tick(); await f.visibility.applyToolRestrictions(); await tick()
+    const before = f.schemaCalls()
+    stored = latestMap; pause = true
+    const applying = f.visibility.applyToolRestrictions(); await tick()
+    await f.visibility.readDisabledTools(true)
+    pause = false; pending.resolve([{ name: TOOL }]); await applying; await tick()
+    assert.deepEqual(f.denied(), expected, 'a cache reader cannot strand the requested visibility change')
+    assert.equal(f.schemaCalls(), before + 1, 'same-policy polling must not repeat expensive schema enumeration')
+    assert.deepEqual(f.visibility.disabledToolsSnapshot(), latestMap)
+  })
+}
+
+test('a different newer sidecar snapshot reconciles the interrupted visibility apply', async t => {
+  const pending = deferred(); let stored = { demo: ['hidden'] }; let pause = false
+  const registered = [{ name: TOOL }, { name: 'mcp__demo__visible' }]
+  const f = fixture(t, { read: async () => stored, schemas: () => pause ? pending.promise : Promise.resolve(registered) })
+  await tick(); await f.visibility.applyToolRestrictions(); await tick()
+  stored = {}; pause = true
+  const applying = f.visibility.applyToolRestrictions(); await tick()
+  stored = { demo: ['*'] }
+  await f.visibility.readDisabledTools(true)
+  pause = false; pending.resolve(registered); await applying; await tick()
+  assert.deepEqual(f.denied(), [TOOL, 'mcp__demo__visible'])
+  assert.equal(isToolDisabledIn(f.visibility.disabledToolsSnapshot(), 'mcp__demo__visible'), true)
+})
+
 test('committed settings invalidate an older forced read before a new replay', async t => {
   const old = deferred()
   const f = fixture(t, { read: () => old.promise })

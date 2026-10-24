@@ -96,8 +96,14 @@ export function createToolVisibility(deps: ToolVisibilityDeps): ToolVisibility {
     }
     // Late reads cannot overwrite either a newer read or a committed settings write.
     if (disposed || mine !== readRevision) return disabledToolsCache?.value ?? out
-    disabledToolsCache = { at: Date.now(), value: out }
-    return out
+    // Repeated reads of the same policy must not invalidate a pending apply.
+    const current = disabledToolsCache?.value
+    const value = current && disabledToolsKey(current) === disabledToolsKey(out) ? current : out
+    disabledToolsCache = { at: Date.now(), value }
+    return value
+  }
+  function disabledToolsKey(value: Record<string, string[]>): string {
+    return JSON.stringify(Object.keys(value).sort().map(server => [server, [...new Set(value[server])].sort()]))
   }
   function setDisabledToolsCache(value: Record<string, string[]>): void {
     if (disposed) return
@@ -348,7 +354,10 @@ export function createToolVisibility(deps: ToolVisibilityDeps): ToolVisibility {
     try {
       registered = new Set((await deps.tools.schemas()).map((schema) => String(schema.name)))
     } catch (e) { return }
-    if (disposed || mine !== replayRevision || map !== disabledToolsCache?.value) return
+    if (disposed || mine !== replayRevision) return
+    // A newer sidecar reader can discover another policy without requesting replay.
+    // Reconcile it rather than leave the old layer installed indefinitely.
+    if (map !== disabledToolsCache?.value) return applyToolRestrictions()
     for (const [serverName, list] of Object.entries(map)) {
       if (list.indexOf('*') < 0) continue
       const prefix = MCP_TOOL_PREFIX + serverName + '__'
@@ -360,7 +369,10 @@ export function createToolVisibility(deps: ToolVisibilityDeps): ToolVisibility {
     if (deps.pluginHiddenTools) {
       try { for (const name of deps.pluginHiddenTools()) wanted.push(name) } catch (e) { /* 读设置失败 = 这次不摘它们 */ }
     }
-    if (disposed || mine !== replayRevision || map !== disabledToolsCache?.value) return
+    if (disposed || mine !== replayRevision) return
+    // A newer sidecar reader can discover another policy without requesting replay.
+    // Reconcile it rather than leave the old layer installed indefinitely.
+    if (map !== disabledToolsCache?.value) return applyToolRestrictions()
     const names = [...new Set(wanted)].filter((name) => registered.has(name))
     const key = names.join('\u0000')
     // 有 `carrierHiddenTools` 时不拿全局键短路：那份名单与"官方工具此时挂没挂"有关，
